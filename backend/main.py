@@ -89,6 +89,20 @@ if FRONTEND_DIR.exists():
     app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
 
+@app.middleware("http")
+async def no_cache_middleware(request: Request, call_next):
+    """
+    Every response is marked non-cacheable. Analysis results must always be
+    computed fresh for the exact bytes submitted — never replayed from a
+    browser or proxy cache — and the demo frontend should always reload its
+    latest assets.
+    """
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     """Never leak stack traces / internals to the client — log and return a clean 500."""

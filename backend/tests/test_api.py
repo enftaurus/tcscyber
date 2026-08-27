@@ -34,6 +34,17 @@ def test_health():
     assert resp.json() == {"status": "ok"}
 
 
+def test_responses_are_never_cacheable():
+    """Every result must be computed fresh — responses carry no-store headers
+    so no browser or proxy ever replays a previous analysis."""
+    for resp in (
+        client.get("/health"),
+        client.get("/sample/benign.exe"),
+        client.post("/analyze", files={"file": ("x.txt", b"hello", "text/plain")}),
+    ):
+        assert "no-store" in resp.headers.get("cache-control", ""), resp.request.url
+
+
 def test_eicar_raw_upload_is_malicious():
     resp = client.post(
         "/analyze",

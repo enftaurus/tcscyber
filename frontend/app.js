@@ -271,6 +271,7 @@ async function analyzeFile(file) {
     const res = await fetch(`${API_BASE}/analyze`, {
       method: "POST",
       body: form,
+      cache: "no-store",   // always compute fresh — never serve a cached result
     });
     const json = await res.json();
     if (!res.ok) {
@@ -286,7 +287,9 @@ async function analyzeFile(file) {
 async function analyzeSample(name) {
   showLoading();
   try {
-    const res = await fetch(`${API_BASE}/sample/${encodeURIComponent(name)}`);
+    const res = await fetch(`${API_BASE}/sample/${encodeURIComponent(name)}`, {
+      cache: "no-store",   // always compute fresh — never serve a cached result
+    });
     const json = await res.json();
     if (!res.ok) {
       showError(json.detail ?? `Server error (${res.status})`);
