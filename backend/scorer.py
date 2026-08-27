@@ -80,7 +80,7 @@ def apply_signature_match(result: ScoreResult, match) -> ScoreResult:
     MALICIOUS / 100 regardless of what the heuristics alone would have said.
     """
     factors = [Factor(
-        label=f"Known signature match: {match.name}",
+        label=f"Known-hash match: {match.name}",
         weight=100,
         detail=match.detail,
     )] + result.factors

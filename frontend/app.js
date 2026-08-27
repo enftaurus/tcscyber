@@ -84,7 +84,7 @@ function escHtml(str) {
   return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace/>/g, "&gt;")
+    .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
 
@@ -181,11 +181,31 @@ function handlePipelineEvent(data) {
       );
       break;
 
+    case "hash_check":
+      if (data.matched) {
+        addPipelineStep(
+          "🚨",
+          "4. Known-Hash Blocklist Check",
+          `Exact hash match: ${data.name} — verdict pinned to MALICIOUS`,
+          "Hash Match",
+          "bad"
+        );
+      } else {
+        addPipelineStep(
+          "🗂️",
+          "4. Known-Hash Blocklist Check",
+          "No match in the known-hash blocklist — continuing structural analysis",
+          "No Match",
+          "ok"
+        );
+      }
+      break;
+
     case "pe_parse":
       if (data.ok) {
         addPipelineStep(
           "🧩",
-          "4. PE Structure Parsing",
+          "5. PE Structure Parsing",
           `MZ/PE header valid · ${data.num_sections} section(s) discovered`,
           "Valid PE",
           "ok"
@@ -193,7 +213,7 @@ function handlePipelineEvent(data) {
       } else {
         addPipelineStep(
           "🧩",
-          "4. PE Structure Parsing",
+          "5. PE Structure Parsing",
           data.error || "No valid PE/MZ header present",
           "Not a PE",
           "neutral"
@@ -208,7 +228,7 @@ function handlePipelineEvent(data) {
         const bClass = maxVal > 7.2 ? "bad" : (maxVal > 6.5 ? "warn" : "ok");
         addPipelineStep(
           "📊",
-          "5. Shannon Entropy Calculation",
+          "6. Shannon Entropy Calculation",
           `Avg section entropy: ${data.avg.toFixed(2)} bits/byte · Max section entropy: ${maxVal.toFixed(2)} bits/byte`,
           badge,
           bClass
@@ -226,7 +246,7 @@ function handlePipelineEvent(data) {
         const bClass = count > 0 ? "bad" : "ok";
         addPipelineStep(
           "⚙️",
-          "6. Import Table Scan",
+          "7. Import Table Scan",
           text,
           badge,
           bClass
@@ -243,7 +263,7 @@ function handlePipelineEvent(data) {
         const bClass = data.outside_text ? "warn" : "ok";
         addPipelineStep(
           "📍",
-          "7. Entry Point Location Check",
+          "8. Entry Point Location Check",
           text,
           badge,
           bClass
@@ -256,7 +276,7 @@ function handlePipelineEvent(data) {
         const bClass = data.verdict === "MALICIOUS" ? "bad" : (data.verdict === "SUSPICIOUS" ? "warn" : "ok");
         addPipelineStep(
           "⚖️",
-          "8 & 9. Heuristic Risk Scoring & Verdict",
+          "9. Heuristic Risk Scoring & Verdict",
           `Score: ${data.risk_score}/100 · Verdict: ${data.verdict} (${data.factors.length} weighted factor(s) triggered)`,
           data.verdict,
           bClass
@@ -305,8 +325,8 @@ function animateRing(targetScore) {
 function renderResult(data) {
   hideTransient();
 
-  // Parse-note banner (non-PE files)
-  if (data.not_pe && data.parse_note) {
+  // Parse-note banner (non-PE files, incl. hash hits on non-PE content)
+  if (data.parse_note) {
     parseNoteText.textContent = data.parse_note;
     parseNote.classList.add("visible");
   } else {

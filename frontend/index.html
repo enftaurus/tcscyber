@@ -23,8 +23,8 @@
         </a>
         <span class="wordmark-tag">Beta</span>
       </div>
-      <div class="header-badge" title="Static analysis only — no binary execution">
-        Static analysis only
+      <div class="header-badge" title="Files are inspected without being executed">
+        No binary execution
       </div>
     </div>
   </div>
@@ -42,7 +42,7 @@
       Upload a Windows <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.exe</code>,
       <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.dll</code>,
       or a <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.zip</code>
-      containing one. Every file is checked against known threat signatures first, then — for PE binaries — entropy, imports, section layout, and entry-point location are inspected structurally. Your file's code is <em>never</em> executed.
+      containing one. Every file moves through a step-by-step pipeline — hashing, known-hash blocklist check, then for PE binaries: entropy, imports, section layout, and entry-point inspection. Each stage is shown live as it runs. Your file's code is <em>never</em> executed.
     </p>
 
     <!-- ── Upload section ─────────────────────────────────────────────────── -->
@@ -94,6 +94,13 @@
                 aria-label="Analyse pre-loaded suspicious-imports sample">
           <span class="sample-dot" style="background:var(--color-suspicious)"></span>
           Suspicious imports
+        </button>
+
+        <button class="sample-btn" id="btn-eicar" type="button"
+                data-sample="eicar.com"
+                aria-label="Analyse the EICAR standard antivirus test file">
+          <span class="sample-dot" style="background:var(--color-malicious)"></span>
+          EICAR test file
         </button>
       </div>
     </section>
@@ -212,7 +219,6 @@
   <div class="container">
     <div class="footer-inner">
       <p class="footer-disclaimer">
-        <strong>Static analysis only.</strong>
         No uploaded binary is executed, mapped as a process, run under emulation, or detonated in any VM or container.
         All pre-loaded samples are <strong>synthetic PE stubs</strong> hand-constructed solely to exhibit specific structural traits — they contain no live or weaponised code.
       </p>

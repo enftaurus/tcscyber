@@ -12,17 +12,20 @@ Pipeline (in order, same for every file):
   1. File received     — read bytes, check extension + size cap
   2. ZIP extraction    — if .zip, unpack in-memory (bomb-safe)
   3. SHA-256 hash      — fingerprint
-  4. PE parsing        — pefile reads MZ → PE headers
-  5. Entropy analysis  — Shannon entropy per section (detects packing)
-  6. Import table      — count imports, flag known-bad APIs
-  7. Entry point       — is EP inside .text or somewhere else?
-  8. Scoring           — additive weighted heuristics → 0-100
-  9. Verdict           — BENIGN / SUSPICIOUS / MALICIOUS
+  4. Known-hash check  — exact match against the hash blocklist
+                         (ships with exactly one entry: EICAR)
+  5. PE parsing        — pefile reads MZ → PE headers
+  6. Entropy analysis  — Shannon entropy per section (detects packing)
+  7. Import table      — count imports, flag known-bad APIs
+  8. Entry point       — is EP inside .text or somewhere else?
+  9. Scoring + verdict — additive weighted heuristics → 0-100
+                         (a hash hit pins MALICIOUS/100, structural
+                         factors are still computed and reported)
 
 The uploaded/sample file is NEVER written to disk or executed.
 All analysis is performed in-memory via static byte inspection.
-Signature/hash short-circuits are intentionally removed: every file
-goes through the full structural pipeline regardless of hash.
+A hash hit never short-circuits the pipeline — every remaining step
+still runs and its findings stay in the report.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ from fastapi.staticfiles import StaticFiles
 
 import analyzer
 import scorer
+import signatures
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -81,7 +85,15 @@ app.add_middleware(
 
 SAMPLES_DIR  = Path(__file__).parent / "samples"
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
-ALLOWED_SAMPLE_NAMES = {"benign.exe", "packed.exe", "suspicious_imports.exe"}
+ALLOWED_SAMPLE_NAMES = {
+    "benign.exe", "packed.exe", "suspicious_imports.exe", "eicar.com",
+}
+
+# Samples served purely from memory, never from disk — an on-disk eicar.com
+# gets quarantined by the host's own antivirus (Windows Defender included).
+IN_MEMORY_SAMPLES = {
+    "eicar.com": lambda: signatures.EICAR_STRING,
+}
 
 if FRONTEND_DIR.exists():
     app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
@@ -243,30 +255,26 @@ def _flatten_zip(raw_bytes: bytes, label: str, depth: int,
 # ── Core streaming pipeline ───────────────────────────────────────────────────
 
 async def _pipeline_stream(filename: str, raw_bytes: bytes,
-                            archive_ctx: Optional[Dict] = None
+                            archive_ctx: Optional[Dict] = None,
+                            skip_received: bool = False
                             ) -> AsyncGenerator[str, None]:
     """
     Emit SSE events for each stage of the analysis pipeline.
 
     Every event is a JSON object with a 'step' field identifying the stage.
     The final event has step='complete' and contains the full result.
+    `skip_received` lets the ZIP wrapper reuse this generator without
+    duplicating the 'received' step it already emitted.
     """
 
     def _sse(payload: Dict) -> str:
         return f"data: {json.dumps(payload)}\n\n"
 
     # ── Step 1: Received ──────────────────────────────────────────────────────
-    yield _sse({"step": "received",
-                "filename": filename,
-                "size": len(raw_bytes)})
-    await asyncio.sleep(0.12)
-
-    # ── Step 2: ZIP extraction (if applicable) ────────────────────────────────
-    if archive_ctx:
-        yield _sse({"step": "zip_extract",
-                    "archive": archive_ctx.get("archive_name", ""),
-                    "extracted": filename,
-                    "total_files": archive_ctx.get("total_files", 1)})
+    if not skip_received:
+        yield _sse({"step": "received",
+                    "filename": filename,
+                    "size": len(raw_bytes)})
         await asyncio.sleep(0.12)
 
     # ── Step 3: SHA-256 hash ──────────────────────────────────────────────────
@@ -274,13 +282,48 @@ async def _pipeline_stream(filename: str, raw_bytes: bytes,
     yield _sse({"step": "hashing", "sha256": sha256})
     await asyncio.sleep(0.12)
 
-    # ── Step 4: PE parsing ────────────────────────────────────────────────────
+    # ── Step 4: Known-hash check (blocklist ships with exactly one entry) ─────
+    match = signatures.match_hash(sha256)
+    yield _sse({"step": "hash_check",
+                "matched": match is not None,
+                "name": match.name if match else None})
+    await asyncio.sleep(0.12)
+
+    # ── Step 5: PE parsing ────────────────────────────────────────────────────
     features = analyzer.extract_features(raw_bytes)
 
     if features.get("parse_error"):
         yield _sse({"step": "pe_parse", "ok": False,
                     "error": "No MZ/PE header found — not a Windows executable"})
         await asyncio.sleep(0.10)
+        if match:
+            # Known-bad but not a PE (EICAR is a DOS COM stub): full report
+            # with raw-byte stats and the hash factor pinning MALICIOUS/100.
+            raw_entropy = features.get("raw_byte_entropy", 0.0)
+            feat_view = {**features,
+                         "avg_section_entropy": raw_entropy,
+                         "max_section_entropy": raw_entropy}
+            score_result = scorer.apply_signature_match(
+                scorer.ScoreResult(risk_score=0.0, verdict="BENIGN", factors=[]),
+                match)
+            yield _sse({"step": "scoring",
+                        "risk_score": score_result.risk_score,
+                        "verdict":    score_result.verdict,
+                        "factors":    [{"label": f.label, "weight": f.weight}
+                                       for f in score_result.factors]})
+            await asyncio.sleep(0.12)
+            result = _build_response(filename, feat_view, score_result, extra={
+                "signature_match": match.name,
+                "parse_note": (
+                    "This file is not a PE binary, so structural PE heuristics "
+                    "do not apply — entropy shown is over the raw bytes. The "
+                    "known-hash check identified it exactly."
+                ),
+                **(archive_ctx or {}),
+            })
+            log.info("hash match (stream): filename=%s name=%s", filename, match.name)
+            yield _sse({"step": "complete", "result": result})
+            return
         result = _not_pe_response(filename, features)
         if archive_ctx:
             result.update(archive_ctx)
@@ -310,8 +353,11 @@ async def _pipeline_stream(filename: str, raw_bytes: bytes,
                 "outside_text": features["ep_outside_text"]})
     await asyncio.sleep(0.15)
 
-    # ── Step 8 & 9: Scoring + Verdict ─────────────────────────────────────────
+    # ── Step 9: Scoring + Verdict ─────────────────────────────────────────────
     score_result = scorer.score(features)
+    if match:
+        # Hash hit on a valid PE: keep every structural factor, pin the verdict
+        score_result = scorer.apply_signature_match(score_result, match)
     yield _sse({"step": "scoring",
                 "risk_score": score_result.risk_score,
                 "verdict":    score_result.verdict,
@@ -320,8 +366,11 @@ async def _pipeline_stream(filename: str, raw_bytes: bytes,
     await asyncio.sleep(0.12)
 
     # ── Complete ───────────────────────────────────────────────────────────────
+    extra: Dict[str, Any] = dict(archive_ctx or {})
+    if match:
+        extra["signature_match"] = match.name
     result = _build_response(filename, features, score_result,
-                             extra=archive_ctx)
+                             extra=extra or None)
     log.info("analyzed (stream): filename=%s sha256=%s verdict=%s score=%s",
              filename, sha256, score_result.verdict, score_result.risk_score)
     yield _sse({"step": "complete", "result": result})
@@ -395,55 +444,11 @@ async def _zip_pipeline_stream(zip_filename: str,
     }
 
     # Stream the inner file through the full pipeline
-    # (skip the 'received' step — already emitted as zip_extract)
-    sha256 = hashlib.sha256(candidate.data).hexdigest()
-    yield _sse({"step": "hashing", "sha256": sha256})
-    await asyncio.sleep(0.12)
-
-    features = analyzer.extract_features(candidate.data)
-
-    if features.get("parse_error"):
-        yield _sse({"step": "pe_parse", "ok": False,
-                    "error": "No MZ/PE header found — not a Windows executable"})
-        await asyncio.sleep(0.10)
-        result = _not_pe_response(candidate.display_name, features)
-        result.update(archive_ctx)
-        yield _sse({"step": "complete", "result": result})
-        return
-
-    yield _sse({"step": "pe_parse",
-                "ok": True,
-                "num_sections": features["num_sections"]})
-    await asyncio.sleep(0.15)
-
-    yield _sse({"step": "entropy",
-                "avg": features["avg_section_entropy"],
-                "max": features["max_section_entropy"]})
-    await asyncio.sleep(0.15)
-
-    yield _sse({"step": "imports",
-                "total":     features["num_imports"],
-                "no_iat":    features["no_import_table"],
-                "suspicious": features["suspicious_apis_found"]})
-    await asyncio.sleep(0.15)
-
-    yield _sse({"step": "ep_check",
-                "outside_text": features["ep_outside_text"]})
-    await asyncio.sleep(0.15)
-
-    score_result = scorer.score(features)
-    yield _sse({"step": "scoring",
-                "risk_score": score_result.risk_score,
-                "verdict":    score_result.verdict,
-                "factors":    [{"label": f.label, "weight": f.weight}
-                               for f in score_result.factors]})
-    await asyncio.sleep(0.12)
-
-    result = _build_response(candidate.display_name, features, score_result,
-                             extra=archive_ctx)
-    log.info("analyzed (stream/zip): filename=%s sha256=%s verdict=%s score=%s",
-             zip_filename, sha256, score_result.verdict, score_result.risk_score)
-    yield _sse({"step": "complete", "result": result})
+    # (skip the 'received' step — already emitted before zip_extract)
+    async for event in _pipeline_stream(candidate.display_name, candidate.data,
+                                        archive_ctx=archive_ctx,
+                                        skip_received=True):
+        yield event
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -519,35 +524,36 @@ async def analyze_stream(file: UploadFile = File(...)):
     )
 
 
-@app.get("/sample/{name}")
-def analyze_sample(name: str):
-    """Classic JSON endpoint for pre-loaded samples."""
+def _load_sample_bytes(name: str) -> bytes:
+    """Resolve a sample's bytes: in-memory samples first, then disk."""
     if name not in ALLOWED_SAMPLE_NAMES:
         raise HTTPException(status_code=404,
             detail=f"Unknown sample '{name}'. Valid: {sorted(ALLOWED_SAMPLE_NAMES)}")
+    if name in IN_MEMORY_SAMPLES:
+        return IN_MEMORY_SAMPLES[name]()
     sample_path = SAMPLES_DIR / name
     if not sample_path.exists():
         raise HTTPException(status_code=503,
             detail=f"Sample '{name}' not found. Run generate_samples.py first.")
-    raw_bytes = sample_path.read_bytes()
-    features  = analyzer.extract_features(raw_bytes)
-    if features.get("parse_error"):
-        return JSONResponse(_not_pe_response(name, features))
-    score_result = scorer.score(features)
-    return JSONResponse(_build_response(name, features, score_result))
+    return sample_path.read_bytes()
+
+
+@app.get("/sample/{name}")
+async def analyze_sample(name: str):
+    """Classic JSON endpoint for pre-loaded samples."""
+    raw_bytes = _load_sample_bytes(name)
+    result: Dict = {}
+    async for event in _pipeline_stream(name, raw_bytes):
+        data = json.loads(event.replace("data: ", "").strip())
+        if data.get("step") == "complete":
+            result = data.get("result", {})
+    return JSONResponse(result)
 
 
 @app.get("/sample/{name}/stream")
 async def stream_sample(name: str):
     """SSE streaming endpoint for pre-loaded samples."""
-    if name not in ALLOWED_SAMPLE_NAMES:
-        raise HTTPException(status_code=404,
-            detail=f"Unknown sample '{name}'. Valid: {sorted(ALLOWED_SAMPLE_NAMES)}")
-    sample_path = SAMPLES_DIR / name
-    if not sample_path.exists():
-        raise HTTPException(status_code=503,
-            detail=f"Sample '{name}' not found. Run generate_samples.py first.")
-    raw_bytes = sample_path.read_bytes()
+    raw_bytes = _load_sample_bytes(name)
     return StreamingResponse(
         _pipeline_stream(name, raw_bytes),
         media_type="text/event-stream",

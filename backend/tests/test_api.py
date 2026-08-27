@@ -40,19 +40,26 @@ def test_responses_are_never_cacheable():
         assert "no-store" in resp.headers.get("cache-control", ""), resp.request.url
 
 
-def test_non_pe_upload_reports_not_pe():
+def test_eicar_raw_upload_is_hash_matched_malicious():
+    """The canonical 68-byte EICAR is the ONE pre-existing blocklist hash —
+    it must be flagged MALICIOUS/100 with a full report (hash factor +
+    raw-byte stats), not short-circuited or dismissed as NOT A PE."""
     resp = client.post(
         "/analyze",
         files={"file": ("eicar.com", EICAR, "application/octet-stream")},
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["verdict"] == "NOT A PE FILE"
-    assert data["not_pe"] is True
+    assert data["verdict"] == "MALICIOUS"
+    assert data["risk_score"] == 100.0
+    assert data["signature_match"] == "EICAR-Test-File"
+    assert any("hash" in f["label"].lower() or "signature" in f["label"].lower()
+               for f in data["factors"])
+    assert data["avg_section_entropy"] > 0  # raw-byte entropy reported
     assert data["sha256"]
 
 
-def test_non_pe_zip_upload_reports_not_pe():
+def test_eicar_zip_upload_is_hash_matched_malicious():
     zbytes = _zip_bytes({"eicar.com": EICAR})
     resp = client.post(
         "/analyze",
@@ -60,8 +67,36 @@ def test_non_pe_zip_upload_reports_not_pe():
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["verdict"] == "NOT A PE FILE"
+    assert data["verdict"] == "MALICIOUS"
+    assert data["signature_match"] == "EICAR-Test-File"
     assert data["archive_name"] == "eicar.zip"
+
+
+def test_only_the_exact_hash_matches():
+    """Exactly ONE pre-existing hash exists: a padded EICAR variant hashes
+    differently and must NOT match the blocklist (it's also not a PE)."""
+    resp = client.post(
+        "/analyze",
+        files={"file": ("eicar.com", EICAR + b"\r\n", "application/octet-stream")},
+    )
+    data = resp.json()
+    assert data["verdict"] == "NOT A PE FILE"
+    assert "signature_match" not in data
+
+
+def test_stream_endpoint_emits_pipeline_steps_in_order():
+    """/analyze/stream must emit step-by-step SSE events ending in 'complete'."""
+    import json as _json
+    with client.stream(
+        "POST", "/analyze/stream",
+        files={"file": ("eicar.com", EICAR, "application/octet-stream")},
+    ) as resp:
+        assert resp.status_code == 200
+        body = b"".join(resp.iter_bytes()).decode()
+    steps = [_json.loads(b[len("data: "):])["step"]
+             for b in body.strip().split("\n\n") if b.startswith("data: ")]
+    assert steps[:4] == ["received", "hashing", "hash_check", "pe_parse"]
+    assert steps[-1] == "complete"
 
 
 def test_empty_zip_reports_gracefully():
@@ -136,7 +171,7 @@ def test_empty_upload_rejected():
     assert resp.status_code == 400
 
 
-@pytest.mark.parametrize("name", ["benign.exe", "packed.exe", "suspicious_imports.exe"])
+@pytest.mark.parametrize("name", ["benign.exe", "packed.exe", "suspicious_imports.exe", "eicar.com"])
 def test_all_preloaded_samples_are_servable(name):
     resp = client.get(f"/sample/{name}")
     assert resp.status_code == 200
