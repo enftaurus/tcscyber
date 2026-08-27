@@ -264,8 +264,26 @@ function escHtml(str) {
 
 async function analyzeFile(file) {
   showLoading();
+
+  // Read the file into memory FIRST. If the OS/antivirus blocks access to it
+  // (Windows Defender does this to real EICAR files the moment they touch
+  // disk), the read fails here — which is a local problem, not a backend one,
+  // and deserves an accurate error message.
+  let buf;
+  try {
+    buf = await file.arrayBuffer();
+  } catch (err) {
+    showError(
+      `Could not read '${file.name}' from disk — your antivirus is likely ` +
+      `blocking or quarantining it (this is expected for real EICAR files). ` +
+      `Use the "EICAR test file" sample button instead: it is generated ` +
+      `in-memory on the server, so no antivirus can interfere. (${err.message})`
+    );
+    return;
+  }
+
   const form = new FormData();
-  form.append("file", file);
+  form.append("file", new Blob([buf]), file.name);
 
   try {
     const res = await fetch(`${API_BASE}/analyze`, {
@@ -280,7 +298,7 @@ async function analyzeFile(file) {
     }
     renderResult(json);
   } catch (err) {
-    showError(`Could not reach the ScanForge backend at ${API_BASE}. Is it running? (${err.message})`);
+    showError(`Could not reach the ScanForge backend at ${API_BASE || window.location.origin}. Is it running? (${err.message})`);
   }
 }
 
