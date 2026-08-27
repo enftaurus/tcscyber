@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ScanForge — Static PE Threat Analysis</title>
+  <meta name="description"
+        content="ScanForge analyses Windows PE binaries (EXE/DLL) for malicious structural characteristics — without executing a single byte. Upload a file and get an instant, explainable risk score." />
+  <meta name="robots" content="noindex" />
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" type="image/svg+xml"
+        href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔬</text></svg>" />
+</head>
+<body>
+
+<!-- ══ HEADER ═══════════════════════════════════════════════════════════════ -->
+<header>
+  <div class="container">
+    <div class="header-inner">
+      <div class="wordmark">
+        <a class="wordmark-logo" href="#" aria-label="ScanForge home">
+          Scan<span>Forge</span>
+        </a>
+        <span class="wordmark-tag">Beta</span>
+      </div>
+      <div class="header-badge" title="Static analysis only — no binary execution">
+        Static analysis only
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ══ MAIN ═════════════════════════════════════════════════════════════════ -->
+<main>
+  <div class="container">
+
+    <!-- Page heading -->
+    <h1 style="font-size:1.55rem;font-weight:700;margin-bottom:6px;letter-spacing:-0.01em;">
+      PE Threat Analysis
+    </h1>
+    <p style="font-size:0.9rem;color:var(--text-secondary);margin-bottom:36px;max-width:560px;">
+      Upload a Windows <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.exe</code>
+      or <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.dll</code>
+      for instant structural analysis. Entropy, imports, section layout, and entry-point location are inspected statically — your file's code is <em>never</em> executed.
+    </p>
+
+    <!-- ── Upload section ─────────────────────────────────────────────────── -->
+    <section id="upload-section" aria-label="File upload">
+      <div id="drop-zone" role="button" tabindex="0" aria-label="Drop a PE file here or click to browse"
+           onkeydown="if(event.key==='Enter'||event.key===' ')document.getElementById('file-input').click()">
+
+        <!-- Upload icon -->
+        <svg class="drop-icon" aria-hidden="true" fill="none" stroke="currentColor"
+             stroke-width="1.5" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5"/>
+        </svg>
+
+        <p class="drop-title">Drop a PE file here</p>
+        <p class="drop-sub">Accepts <span>.exe</span> <span>.dll</span> <span>.bin</span> <span>.zip</span> <span>.txt</span> · max 50 MB</p>
+
+        <input type="file" id="file-input" accept=".exe,.dll,.zip,.txt,.bin"
+               aria-label="Select file for analysis" />
+
+        <button class="browse-btn" id="browse-btn" type="button">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
+               viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round"
+                  d="M12 16.5V9.75m0 0 3 3m-3-3-3 3M6.75 19.5a4.5 4.5 0 0 1-1.41-8.775 5.25 5.25 0 0 1 10.338-2.32 5.75 5.75 0 0 1 1.023 11.095"/>
+          </svg>
+          Browse file
+        </button>
+      </div>
+
+      <!-- Sample buttons -->
+      <div class="samples-row">
+        <span class="samples-label">Try a sample:</span>
+
+        <button class="sample-btn" id="btn-benign" type="button" data-sample="benign.exe"
+                aria-label="Analyse pre-loaded benign sample">
+          <span class="sample-dot" style="background:var(--color-benign)"></span>
+          Benign
+        </button>
+
+        <button class="sample-btn" id="btn-packed" type="button" data-sample="packed.exe"
+                aria-label="Analyse pre-loaded packed/encrypted sample">
+          <span class="sample-dot" style="background:var(--color-malicious)"></span>
+          Packed (high entropy)
+        </button>
+
+        <button class="sample-btn" id="btn-suspicious" type="button"
+                data-sample="suspicious_imports.exe"
+                aria-label="Analyse pre-loaded suspicious-imports sample">
+          <span class="sample-dot" style="background:var(--color-suspicious)"></span>
+          Suspicious imports
+        </button>
+      </div>
+    </section>
+
+    <!-- ── Loading ─────────────────────────────────────────────────────────── -->
+    <div id="loading-state" role="status" aria-live="polite" aria-label="Analysing file">
+      <div class="spinner" aria-hidden="true"></div>
+      <p class="loading-text">Analysing PE structure…</p>
+    </div>
+
+    <!-- ── Error ───────────────────────────────────────────────────────────── -->
+    <div id="error-state" role="alert" aria-live="assertive">
+      <svg class="error-icon" width="18" height="18" fill="none" stroke="currentColor"
+           stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round"
+              d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z"/>
+      </svg>
+      <div>
+        <p class="error-title">Analysis failed</p>
+        <p id="error-message"></p>
+      </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- RESULTS PANEL                                                        -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <div id="results-panel" aria-live="polite">
+
+      <!-- Non-PE info banner -->
+      <div id="parse-note" role="note">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
+             viewBox="0 0 24 24" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M11.25 11.25l.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z"/>
+        </svg>
+        <span id="parse-note-text"></span>
+      </div>
+
+      <!-- ── Verdict card ─────────────────────────────────────────────────── -->
+      <div class="card" id="verdict-card">
+        <!-- Score ring -->
+        <div class="ring-wrap" aria-hidden="true">
+          <svg class="ring-svg" width="96" height="96" viewBox="0 0 96 96">
+            <circle class="ring-track" cx="48" cy="48" r="42" />
+            <circle class="ring-fill" id="ring-fill" cx="48" cy="48" r="42"
+                    stroke-dasharray="263.89" stroke-dashoffset="263.89" />
+          </svg>
+          <div class="ring-label">
+            <span id="score-number">0</span>
+            <small>/ 100</small>
+          </div>
+        </div>
+
+        <!-- Verdict text -->
+        <div class="verdict-info">
+          <p class="verdict-filename" id="result-filename"></p>
+          <div id="verdict-pill" class="verdict-pill benign" role="img" aria-label="Verdict">
+            <span class="verdict-pill-dot"></span>
+            BENIGN
+          </div>
+          <p class="verdict-meta" id="verdict-meta"></p>
+        </div>
+      </div>
+
+      <!-- ── Stat grid ────────────────────────────────────────────────────── -->
+      <div id="stat-grid" role="table" aria-label="File statistics">
+        <div class="stat-cell" role="cell">
+          <p class="stat-label">SHA-256</p>
+          <p class="stat-value mono-sm" id="stat-sha256" title="">—</p>
+        </div>
+        <div class="stat-cell" role="cell">
+          <p class="stat-label">File size</p>
+          <p class="stat-value" id="stat-size">—</p>
+        </div>
+        <div class="stat-cell" role="cell">
+          <p class="stat-label">Sections</p>
+          <p class="stat-value" id="stat-sections">—</p>
+        </div>
+        <div class="stat-cell" role="cell">
+          <p class="stat-label">Avg. entropy</p>
+          <p class="stat-value" id="stat-entropy">—</p>
+        </div>
+      </div>
+
+      <!-- ── Suspicious APIs ──────────────────────────────────────────────── -->
+      <div id="api-section" class="card">
+        <div style="padding:14px 20px 0;">
+          <p class="section-label">Flagged API imports</p>
+        </div>
+        <div id="api-chips" class="api-chips" role="list" aria-label="Suspicious APIs found"></div>
+      </div>
+
+      <!-- ── Risk factors ─────────────────────────────────────────────────── -->
+      <div class="card" id="factors-section">
+        <div style="padding:16px 20px 0;border-bottom:1px solid var(--bg-subtle);padding-bottom:12px;">
+          <p class="section-label">Risk factor breakdown</p>
+        </div>
+        <div id="factors-list" class="factors-list" role="list" aria-label="Risk factors">
+          <!-- populated by JS -->
+        </div>
+      </div>
+
+    </div>
+    <!-- /results-panel -->
+
+  </div>
+</main>
+
+<!-- ══ FOOTER ════════════════════════════════════════════════════════════════ -->
+<footer>
+  <div class="container">
+    <div class="footer-inner">
+      <p class="footer-disclaimer">
+        <strong>Static analysis only.</strong>
+        No uploaded binary is executed, mapped as a process, run under emulation, or detonated in any VM or container.
+        All pre-loaded samples are <strong>synthetic PE stubs</strong> hand-constructed solely to exhibit specific structural traits — they contain no live or weaponised code.
+      </p>
+      <span class="footer-right">ScanForge v1.0 · Hackathon build</span>
+    </div>
+  </div>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

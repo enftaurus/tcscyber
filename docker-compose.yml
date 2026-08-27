@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: scanforge-backend
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # The container has no network egress needed for analysis — but we keep
+    # internet access available so the demo machine can pull updates easily.
+    # For a hardened setup, uncomment: network_mode: "none"
