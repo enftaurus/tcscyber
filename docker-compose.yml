@@ -9,6 +9,18 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    environment:
+      # Comma-separated list of origins allowed to call the API cross-origin.
+      # Leave unset only for local/demo use — main.py logs a warning and
+      # falls back to "*" (wide open) if this isn't set.
+      - SCANFORGE_ALLOWED_ORIGINS=${SCANFORGE_ALLOWED_ORIGINS:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     # The container has no network egress needed for analysis — but we keep
     # internet access available so the demo machine can pull updates easily.
     # For a hardened setup, uncomment: network_mode: "none"

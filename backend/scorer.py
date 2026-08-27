@@ -68,6 +68,26 @@ BENIGN_MAX     = 24
 SUSPICIOUS_MAX = 49
 
 
+def score_signature_match(match) -> ScoreResult:
+    """
+    Build a deterministic MALICIOUS-tier ScoreResult for a known-signature hit.
+
+    Signature matches (see signatures.py) are exact/substring identifications
+    of a known file, so they bypass the heuristic weighting below entirely —
+    a known threat is reported at maximum confidence regardless of what the
+    structural PE heuristics would otherwise say.
+    """
+    return ScoreResult(
+        risk_score=100.0,
+        verdict="MALICIOUS",
+        factors=[Factor(
+            label=f"Known signature match: {match.name}",
+            weight=100,
+            detail=match.detail,
+        )],
+    )
+
+
 def score(features: dict) -> ScoreResult:
     """
     Compute risk score and verdict from extracted PE features.

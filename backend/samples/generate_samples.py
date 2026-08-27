@@ -396,6 +396,13 @@ def build_suspicious_imports() -> bytes:
     )
 
 
+# NOTE: the EICAR test sample is deliberately NOT generated here. Writing
+# eicar.com to disk gets it quarantined/blocked by the host's own antivirus
+# (Windows Defender included) — the whole point of EICAR is that every AV
+# flags it. The backend serves it purely in-memory instead: see
+# IN_MEMORY_SAMPLES in main.py, built from signatures.EICAR_STRING.
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():

@@ -36,12 +36,13 @@
 
     <!-- Page heading -->
     <h1 style="font-size:1.55rem;font-weight:700;margin-bottom:6px;letter-spacing:-0.01em;">
-      PE Threat Analysis
+      Static Threat Analysis
     </h1>
     <p style="font-size:0.9rem;color:var(--text-secondary);margin-bottom:36px;max-width:560px;">
-      Upload a Windows <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.exe</code>
-      or <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.dll</code>
-      for instant structural analysis. Entropy, imports, section layout, and entry-point location are inspected statically — your file's code is <em>never</em> executed.
+      Upload a Windows <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.exe</code>,
+      <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.dll</code>,
+      or a <code style="font-family:var(--font-mono);font-size:0.82rem;background:var(--bg-subtle);border:1px solid var(--border);padding:1px 5px;border-radius:4px;">.zip</code>
+      containing one. Every file is checked against known threat signatures first, then — for PE binaries — entropy, imports, section layout, and entry-point location are inspected structurally. Your file's code is <em>never</em> executed.
     </p>
 
     <!-- ── Upload section ─────────────────────────────────────────────────── -->
@@ -56,10 +57,10 @@
                 d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5"/>
         </svg>
 
-        <p class="drop-title">Drop a PE file here</p>
-        <p class="drop-sub">Accepts <span>.exe</span> <span>.dll</span> <span>.bin</span> <span>.zip</span> <span>.txt</span> · max 50 MB</p>
+        <p class="drop-title">Drop a file here</p>
+        <p class="drop-sub">Accepts <span>.exe</span> <span>.dll</span> <span>.com</span> <span>.bin</span> <span>.zip</span> <span>.txt</span> · max 50 MB</p>
 
-        <input type="file" id="file-input" accept=".exe,.dll,.zip,.txt,.bin"
+        <input type="file" id="file-input" accept=".exe,.dll,.zip,.txt,.bin,.com"
                aria-label="Select file for analysis" />
 
         <button class="browse-btn" id="browse-btn" type="button">
@@ -93,6 +94,13 @@
                 aria-label="Analyse pre-loaded suspicious-imports sample">
           <span class="sample-dot" style="background:var(--color-suspicious)"></span>
           Suspicious imports
+        </button>
+
+        <button class="sample-btn" id="btn-eicar" type="button"
+                data-sample="eicar.com"
+                aria-label="Analyse the EICAR standard antivirus test file">
+          <span class="sample-dot" style="background:var(--color-malicious)"></span>
+          EICAR test file
         </button>
       </div>
     </section>

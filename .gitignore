@@ -29,6 +29,7 @@ docker-compose.override.yml
 backend/samples/*.exe
 backend/samples/*.dll
 backend/samples/*.bin
+backend/samples/*.com
 
 # ── OS / editor noise ─────────────────────────────────────────────────────────
 .DS_Store
