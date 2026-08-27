@@ -44,6 +44,10 @@ def test_eicar_raw_upload_is_malicious():
     assert data["verdict"] == "MALICIOUS"
     assert data["risk_score"] == 100.0
     assert data["signature_match"]
+    # Full pipeline ran: signature factor present, raw-byte entropy reported
+    assert any("signature" in f["label"].lower() for f in data["factors"])
+    assert data["avg_section_entropy"] > 0
+    assert data["sha256"]
 
 
 def test_eicar_zip_upload_is_malicious():
@@ -57,6 +61,32 @@ def test_eicar_zip_upload_is_malicious():
     assert data["verdict"] == "MALICIOUS"
     assert data["signature_match"]
     assert data["archive_name"] == "eicar.zip"
+    # The zipped entry followed the same full pipeline as a raw upload
+    assert any("signature" in f["label"].lower() for f in data["factors"])
+    assert data["avg_section_entropy"] > 0
+
+
+def test_signature_match_keeps_structural_factors_for_pe():
+    """A PE that ALSO matches a signature must keep its structural factors
+    in the report alongside the leading signature factor."""
+    import signatures as sigs
+    from pathlib import Path
+    pe_bytes = Path(main.SAMPLES_DIR / "packed.exe").read_bytes()
+    sha = __import__("hashlib").sha256(pe_bytes).hexdigest()
+    sigs.KNOWN_HASHES[sha] = "Test-Packed-Signature"
+    try:
+        resp = client.post(
+            "/analyze",
+            files={"file": ("packed.exe", pe_bytes, "application/octet-stream")},
+        )
+        data = resp.json()
+        assert data["verdict"] == "MALICIOUS"
+        assert data["risk_score"] == 100.0
+        labels = [f["label"].lower() for f in data["factors"]]
+        assert any("signature" in l for l in labels)
+        assert any("entropy" in l for l in labels)  # structural factor retained
+    finally:
+        del sigs.KNOWN_HASHES[sha]
 
 
 def test_nested_zip_with_eicar_is_still_detected():

@@ -142,8 +142,8 @@ function animateRing(targetScore) {
 function renderResult(data) {
   hideTransient();
 
-  // Parse-note banner (non-PE files)
-  if (data.not_pe && data.parse_note) {
+  // Parse-note banner (non-PE files, incl. signature hits on non-PE content)
+  if (data.parse_note) {
     parseNoteText.textContent = data.parse_note;
     parseNote.classList.add("visible");
   } else {

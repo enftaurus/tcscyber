@@ -164,42 +164,52 @@ def _not_pe_response(filename: str, features: Dict,
     }
 
 
-def _signature_response(filename: str, raw_bytes: bytes,
-                        match: signatures.SignatureMatch,
-                        extra: Optional[Dict] = None) -> Dict:
-    """Build a MALICIOUS-tier response for a known-signature hit (see signatures.py)."""
-    features: Dict[str, Any] = {
-        "sha256":               hashlib.sha256(raw_bytes).hexdigest(),
-        "file_size":            len(raw_bytes),
-        "num_sections":         0,
-        "avg_section_entropy":  0.0,
-        "max_section_entropy":  0.0,
-        "num_imports":          0,
-        "suspicious_api_count": 0,
-        "suspicious_apis_found": [],
-    }
-    score_result = scorer.score_signature_match(match)
-    resp = _build_response(filename, features, score_result,
-                           extra={"signature_match": match.name, **(extra or {})})
-    return resp
-
-
-def _analyze_bytes(filename: str, raw_bytes: bytes) -> Dict:
+def _analyze_bytes(filename: str, raw_bytes: bytes,
+                   extra: Optional[Dict] = None) -> Dict:
     """
-    Analyse raw bytes: known-signature check first (catches EICAR and any
-    other non-PE known-bad content), then PE structural analysis.
-    Returns a graceful response if it's neither a signature hit nor a PE.
+    Analyse raw bytes through the FULL pipeline: PE structural analysis
+    (entropy, imports, section layout, entry point) plus a known-signature
+    scan. A signature hit does not skip the structural pass — it is added
+    to the report as the leading factor and pins the verdict to
+    MALICIOUS / 100. Returns a graceful response for files that are neither
+    a PE nor a signature hit.
     """
     match = signatures.scan_signatures(raw_bytes)
+    features = analyzer.extract_features(raw_bytes)
+
+    if features.get("parse_error"):
+        if match is None:
+            resp = _not_pe_response(filename, features)
+            if extra:
+                resp.update(extra)
+            return resp
+        # Known-bad but not a PE (e.g. EICAR, a DOS COM stub) — still produce
+        # a full report: hash, size, raw-byte entropy, and the signature factor.
+        log.info("signature match: filename=%s signature=%s", filename, match.name)
+        raw_entropy = features.get("raw_byte_entropy", 0.0)
+        feat_view = {**features,
+                     "avg_section_entropy": raw_entropy,
+                     "max_section_entropy": raw_entropy}
+        score_result = scorer.apply_signature_match(
+            scorer.ScoreResult(risk_score=0.0, verdict="BENIGN", factors=[]), match)
+        return _build_response(filename, feat_view, score_result, extra={
+            "signature_match": match.name,
+            "parse_note": (
+                "This file is not a PE binary, so structural PE heuristics do "
+                "not apply — entropy shown is over the raw bytes. Signature "
+                "detection applies to any file type and identified it exactly."
+            ),
+            **(extra or {}),
+        })
+
+    # Valid PE — full structural scoring, with the signature overlay on top
+    score_result = scorer.score(features)
     if match:
         log.info("signature match: filename=%s signature=%s", filename, match.name)
-        return _signature_response(filename, raw_bytes, match)
-
-    features = analyzer.extract_features(raw_bytes)
-    if features.get("parse_error"):
-        return _not_pe_response(filename, features)
-    score_result = scorer.score(features)
-    return _build_response(filename, features, score_result)
+        score_result = scorer.apply_signature_match(score_result, match)
+        return _build_response(filename, features, score_result,
+                               extra={"signature_match": match.name, **(extra or {})})
+    return _build_response(filename, features, score_result, extra=extra)
 
 
 # ── ZIP handling ──────────────────────────────────────────────────────────────
@@ -356,17 +366,19 @@ def _analyze_zip(zip_filename: str, raw_bytes: bytes) -> Dict:
         return preview + ("…" if len(all_names) > limit else "")
 
     # ── Pass 1: known-signature scan across every extracted file ─────────────
+    # A matching entry is then run through the FULL analysis pipeline
+    # (structural stats + signature factor), same as a raw upload would be.
     for entry in real_entries:
         match = signatures.scan_signatures(entry.data)
         if match:
             log.info("signature match in zip: archive=%s entry=%s signature=%s",
                      zip_filename, entry.display_name, match.name)
-            return _signature_response(
-                entry.display_name, entry.data, match,
+            return _analyze_bytes(
+                entry.display_name, entry.data,
                 extra={
                     "archive_name": zip_filename,
                     "archive_note": (
-                        f"Known-signature match found in '{entry.display_name}' inside "
+                        f"Analysed '{entry.display_name}' extracted from "
                         f"'{zip_filename}'. Archive contained {len(all_names)} "
                         f"file(s): {_contents_preview(8)}."
                     ),

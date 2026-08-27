@@ -68,24 +68,23 @@ BENIGN_MAX     = 24
 SUSPICIOUS_MAX = 49
 
 
-def score_signature_match(match) -> ScoreResult:
+def apply_signature_match(result: ScoreResult, match) -> ScoreResult:
     """
-    Build a deterministic MALICIOUS-tier ScoreResult for a known-signature hit.
+    Overlay a known-signature hit onto a structural score.
 
-    Signature matches (see signatures.py) are exact/substring identifications
-    of a known file, so they bypass the heuristic weighting below entirely —
-    a known threat is reported at maximum confidence regardless of what the
-    structural PE heuristics would otherwise say.
+    The signature match does NOT replace the structural analysis — the file
+    still goes through the full pipeline (entropy, imports, section layout…)
+    and every structural factor it triggered is kept in the report. The
+    signature hit is added as the leading factor and, because it is an exact
+    identification of a known file, it pins the overall result to
+    MALICIOUS / 100 regardless of what the heuristics alone would have said.
     """
-    return ScoreResult(
-        risk_score=100.0,
-        verdict="MALICIOUS",
-        factors=[Factor(
-            label=f"Known signature match: {match.name}",
-            weight=100,
-            detail=match.detail,
-        )],
-    )
+    factors = [Factor(
+        label=f"Known signature match: {match.name}",
+        weight=100,
+        detail=match.detail,
+    )] + result.factors
+    return ScoreResult(risk_score=100.0, verdict="MALICIOUS", factors=factors)
 
 
 def score(features: dict) -> ScoreResult:
