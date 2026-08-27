@@ -2,39 +2,51 @@
 main.py — ScanForge FastAPI backend.
 
 Endpoints:
-  GET  /health              → liveness probe
-  POST /analyze             → multipart file upload → JSON analysis result
-  GET  /sample/{name}       → analyze a pre-loaded synthetic sample by name
+  GET  /health                → liveness probe
+  POST /analyze               → multipart upload → JSON result
+  POST /analyze/stream        → multipart upload → SSE step-by-step stream
+  GET  /sample/{name}         → analyze a pre-loaded synthetic sample (JSON)
+  GET  /sample/{name}/stream  → pre-loaded sample as SSE stream
+
+Pipeline (in order, same for every file):
+  1. File received     — read bytes, check extension + size cap
+  2. ZIP extraction    — if .zip, unpack in-memory (bomb-safe)
+  3. SHA-256 hash      — fingerprint
+  4. PE parsing        — pefile reads MZ → PE headers
+  5. Entropy analysis  — Shannon entropy per section (detects packing)
+  6. Import table      — count imports, flag known-bad APIs
+  7. Entry point       — is EP inside .text or somewhere else?
+  8. Scoring           — additive weighted heuristics → 0-100
+  9. Verdict           — BENIGN / SUSPICIOUS / MALICIOUS
 
 The uploaded/sample file is NEVER written to disk or executed.
 All analysis is performed in-memory via static byte inspection.
-ZIP archives are unpacked in-memory; each contained file is probed as a PE.
+Signature/hash short-circuits are intentionally removed: every file
+goes through the full structural pipeline regardless of hash.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
+import json
 import logging
 import os
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import analyzer
 import scorer
-import signatures
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-# Audit trail of what was scanned and what came back — never the file content
-# itself, only identifying metadata (name, hash, verdict).
-
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
@@ -43,22 +55,18 @@ log = logging.getLogger("scanforge")
 
 
 # ── App setup ─────────────────────────────────────────────────────────────────
-
 app = FastAPI(
     title="ScanForge",
     description="Static PE threat analysis — no binary execution, ever.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
-# CORS: default is permissive for local/demo use. For a real deployment, set
-# SCANFORGE_ALLOWED_ORIGINS to a comma-separated allowlist (e.g.
-# "https://scanforge.example.com") so the API isn't callable cross-origin
-# from arbitrary sites.
 _allowed_origins_env = os.environ.get("SCANFORGE_ALLOWED_ORIGINS", "").strip()
-if _allowed_origins_env:
-    ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
-else:
-    ALLOWED_ORIGINS = ["*"]
+ALLOWED_ORIGINS = (
+    [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+    if _allowed_origins_env else ["*"]
+)
+if "*" in ALLOWED_ORIGINS:
     log.warning(
         "SCANFORGE_ALLOWED_ORIGINS not set — CORS is wide open ('*'). "
         "Set it before deploying anywhere reachable by untrusted origins."
@@ -73,17 +81,7 @@ app.add_middleware(
 
 SAMPLES_DIR  = Path(__file__).parent / "samples"
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
-ALLOWED_SAMPLE_NAMES = {
-    "benign.exe", "packed.exe", "suspicious_imports.exe", "eicar.com",
-}
-
-# Samples served purely from memory, never from disk. EICAR must live here:
-# any real antivirus (including Windows Defender on the host running this
-# server) quarantines/blocks an on-disk eicar.com the moment it is written,
-# which would break the demo on exactly the machines it runs on.
-IN_MEMORY_SAMPLES = {
-    "eicar.com": lambda: signatures.EICAR_STRING,
-}
+ALLOWED_SAMPLE_NAMES = {"benign.exe", "packed.exe", "suspicious_imports.exe"}
 
 if FRONTEND_DIR.exists():
     app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
@@ -91,12 +89,6 @@ if FRONTEND_DIR.exists():
 
 @app.middleware("http")
 async def no_cache_middleware(request: Request, call_next):
-    """
-    Every response is marked non-cacheable. Analysis results must always be
-    computed fresh for the exact bytes submitted — never replayed from a
-    browser or proxy cache — and the demo frontend should always reload its
-    latest assets.
-    """
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     response.headers["Pragma"] = "no-cache"
@@ -105,7 +97,6 @@ async def no_cache_middleware(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    """Never leak stack traces / internals to the client — log and return a clean 500."""
     log.exception("Unhandled error on %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=500,
@@ -113,15 +104,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
-# ── PE-likely extensions to prioritise inside a ZIP ───────────────────────────
+# ── ZIP safety limits ─────────────────────────────────────────────────────────
+MAX_ZIP_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024
+MAX_ZIP_ENTRY_UNCOMPRESSED = 50  * 1024 * 1024
+MAX_ZIP_ENTRIES            = 500
+MAX_ZIP_DEPTH              = 2
+_ZIP_READ_CHUNK            = 1024 * 1024
 _PE_PRIORITY_EXTS = {".exe", ".dll", ".com", ".bin", ".sys", ".drv", ".ocx"}
-
-# ── ZIP safety limits (defense against decompression / entry-count bombs) ────
-MAX_ZIP_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024   # 100 MB aggregate per scan
-MAX_ZIP_ENTRY_UNCOMPRESSED = 50 * 1024 * 1024    # 50 MB per individual member
-MAX_ZIP_ENTRIES            = 500                  # across the whole archive tree
-MAX_ZIP_DEPTH              = 2                    # top-level zip + one nested level
-_ZIP_READ_CHUNK             = 1024 * 1024
 
 
 # ── Response builders ─────────────────────────────────────────────────────────
@@ -153,7 +142,6 @@ def _build_response(filename: str, features: Dict[str, Any],
 
 def _not_pe_response(filename: str, features: Dict,
                      parse_note: Optional[str] = None) -> Dict:
-    """Graceful partial-analysis result for files that are not valid PEs."""
     raw_entropy = features.get("raw_byte_entropy", 0.0)
     note = parse_note or (
         "This file does not have a valid PE/MZ header. "
@@ -178,72 +166,19 @@ def _not_pe_response(filename: str, features: Dict,
     }
 
 
-def _analyze_bytes(filename: str, raw_bytes: bytes,
-                   extra: Optional[Dict] = None) -> Dict:
-    """
-    Analyse raw bytes through the FULL pipeline: PE structural analysis
-    (entropy, imports, section layout, entry point) plus a known-signature
-    scan. A signature hit does not skip the structural pass — it is added
-    to the report as the leading factor and pins the verdict to
-    MALICIOUS / 100. Returns a graceful response for files that are neither
-    a PE nor a signature hit.
-    """
-    match = signatures.scan_signatures(raw_bytes)
-    features = analyzer.extract_features(raw_bytes)
-
-    if features.get("parse_error"):
-        if match is None:
-            resp = _not_pe_response(filename, features)
-            if extra:
-                resp.update(extra)
-            return resp
-        # Known-bad but not a PE (e.g. EICAR, a DOS COM stub) — still produce
-        # a full report: hash, size, raw-byte entropy, and the signature factor.
-        log.info("signature match: filename=%s signature=%s", filename, match.name)
-        raw_entropy = features.get("raw_byte_entropy", 0.0)
-        feat_view = {**features,
-                     "avg_section_entropy": raw_entropy,
-                     "max_section_entropy": raw_entropy}
-        score_result = scorer.apply_signature_match(
-            scorer.ScoreResult(risk_score=0.0, verdict="BENIGN", factors=[]), match)
-        return _build_response(filename, feat_view, score_result, extra={
-            "signature_match": match.name,
-            "parse_note": (
-                "This file is not a PE binary, so structural PE heuristics do "
-                "not apply — entropy shown is over the raw bytes. Signature "
-                "detection applies to any file type and identified it exactly."
-            ),
-            **(extra or {}),
-        })
-
-    # Valid PE — full structural scoring, with the signature overlay on top
-    score_result = scorer.score(features)
-    if match:
-        log.info("signature match: filename=%s signature=%s", filename, match.name)
-        score_result = scorer.apply_signature_match(score_result, match)
-        return _build_response(filename, features, score_result,
-                               extra={"signature_match": match.name, **(extra or {})})
-    return _build_response(filename, features, score_result, extra=extra)
-
-
 # ── ZIP handling ──────────────────────────────────────────────────────────────
 
 class ZipSafetyError(Exception):
-    """Raised when an archive violates a decompression/entry-count safety guard."""
+    pass
 
 
 @dataclass
 class _ZipEntry:
     display_name: str
-    data: bytes  # empty means "present but unreadable" (e.g. password-protected)
+    data: bytes
 
 
 def _read_entry_capped(zf: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int) -> bytes:
-    """
-    Read one ZIP member in chunks, enforcing `cap` against the bytes actually
-    produced by decompression — not just the (spoofable) declared size in the
-    archive's central directory. This is the real defense against ZIP bombs.
-    """
     chunks: List[bytes] = []
     total = 0
     with zf.open(info) as fh:
@@ -254,8 +189,8 @@ def _read_entry_capped(zf: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int) -> 
             total += len(chunk)
             if total > cap:
                 raise ZipSafetyError(
-                    f"'{info.filename}' exceeded the {cap // (1024 * 1024)} MB "
-                    "decompression limit while reading (possible ZIP bomb)."
+                    f"'{info.filename}' exceeded the {cap // (1024*1024)} MB "
+                    "decompression limit (possible ZIP bomb)."
                 )
             chunks.append(chunk)
     return b"".join(chunks)
@@ -263,18 +198,9 @@ def _read_entry_capped(zf: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int) -> 
 
 def _flatten_zip(raw_bytes: bytes, label: str, depth: int,
                  budget: Dict[str, int], entries: List[_ZipEntry]) -> None:
-    """
-    Recursively walk a ZIP's members — one extra level of nested ZIPs is
-    followed — appending every real file's bytes to `entries`, entirely
-    in-memory. Mutates `budget` in place; raises ZipSafetyError if any
-    safety limit (entry count, per-entry size, or aggregate decompressed
-    size) is exceeded. Nothing is ever written to disk.
-    """
     try:
         zf = zipfile.ZipFile(io.BytesIO(raw_bytes))
     except zipfile.BadZipFile:
-        # Named like a zip (or nested inside one) but isn't actually valid —
-        # treat its raw bytes as a plain file entry instead of an archive.
         entries.append(_ZipEntry(label or "archive", raw_bytes))
         return
 
@@ -282,36 +208,29 @@ def _flatten_zip(raw_bytes: bytes, label: str, depth: int,
         for info in zf.infolist():
             if info.is_dir():
                 continue
-
             budget["count"] += 1
             if budget["count"] > MAX_ZIP_ENTRIES:
                 raise ZipSafetyError(
-                    f"archive contains more than {MAX_ZIP_ENTRIES} files — aborted for safety."
+                    f"archive contains more than {MAX_ZIP_ENTRIES} files — aborted."
                 )
-
             display_name = f"{label} > {info.filename}" if label else info.filename
             per_entry_cap = min(MAX_ZIP_ENTRY_UNCOMPRESSED, budget["remaining"])
-
             if info.file_size > per_entry_cap:
                 raise ZipSafetyError(
-                    f"'{info.filename}' declares {info.file_size:,} bytes uncompressed, "
-                    f"exceeding the safe decompression budget (possible ZIP bomb)."
+                    f"'{info.filename}' declares {info.file_size:,} bytes, "
+                    "exceeding the safe decompression budget (possible ZIP bomb)."
                 )
-
             try:
                 data = _read_entry_capped(zf, info, per_entry_cap)
             except RuntimeError:
-                # zipfile raises RuntimeError (not BadZipFile) for encrypted entries
-                entries.append(_ZipEntry(f"{display_name} [password-protected, skipped]", b""))
+                entries.append(_ZipEntry(f"{display_name} [password-protected]", b""))
                 continue
             except ZipSafetyError:
                 raise
             except Exception:
-                entries.append(_ZipEntry(f"{display_name} [unreadable, skipped]", b""))
+                entries.append(_ZipEntry(f"{display_name} [unreadable]", b""))
                 continue
-
             budget["remaining"] -= len(data)
-
             child_ext = os.path.splitext(info.filename)[1].lower()
             if child_ext == ".zip" and depth < MAX_ZIP_DEPTH and data:
                 _flatten_zip(data, display_name, depth + 1, budget, entries)
@@ -321,187 +240,321 @@ def _flatten_zip(raw_bytes: bytes, label: str, depth: int,
         zf.close()
 
 
-def _analyze_zip(zip_filename: str, raw_bytes: bytes) -> Dict:
-    """
-    Unpack a ZIP archive entirely in-memory (one level of nested ZIPs
-    included) and scan every contained file — first for known threat
-    signatures (catches EICAR and anything else that isn't a PE at all),
-    then for PE structural risk. No bytes are ever written to disk or
-    executed at any point.
+# ── Core streaming pipeline ───────────────────────────────────────────────────
 
-    Strategy:
-      1. Try to open as a ZIP; if it fails, fall back to raw analysis.
-      2. Flatten all members in-memory, enforcing decompression-bomb,
-         entry-count, and per-entry size guards along the way.
-      3. Pass 1 — signature scan every extracted file; a hit wins
-         immediately and is reported as MALICIOUS regardless of PE-ness.
-      4. Pass 2 — PE structural scan, PE-likely extensions first; return
-         the first valid PE's full analysis.
-      5. Nothing found → a descriptive summary listing archive contents.
+async def _pipeline_stream(filename: str, raw_bytes: bytes,
+                            archive_ctx: Optional[Dict] = None
+                            ) -> AsyncGenerator[str, None]:
     """
+    Emit SSE events for each stage of the analysis pipeline.
+
+    Every event is a JSON object with a 'step' field identifying the stage.
+    The final event has step='complete' and contains the full result.
+    """
+
+    def _sse(payload: Dict) -> str:
+        return f"data: {json.dumps(payload)}\n\n"
+
+    # ── Step 1: Received ──────────────────────────────────────────────────────
+    yield _sse({"step": "received",
+                "filename": filename,
+                "size": len(raw_bytes)})
+    await asyncio.sleep(0.12)
+
+    # ── Step 2: ZIP extraction (if applicable) ────────────────────────────────
+    if archive_ctx:
+        yield _sse({"step": "zip_extract",
+                    "archive": archive_ctx.get("archive_name", ""),
+                    "extracted": filename,
+                    "total_files": archive_ctx.get("total_files", 1)})
+        await asyncio.sleep(0.12)
+
+    # ── Step 3: SHA-256 hash ──────────────────────────────────────────────────
+    sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    yield _sse({"step": "hashing", "sha256": sha256})
+    await asyncio.sleep(0.12)
+
+    # ── Step 4: PE parsing ────────────────────────────────────────────────────
+    features = analyzer.extract_features(raw_bytes)
+
+    if features.get("parse_error"):
+        yield _sse({"step": "pe_parse", "ok": False,
+                    "error": "No MZ/PE header found — not a Windows executable"})
+        await asyncio.sleep(0.10)
+        result = _not_pe_response(filename, features)
+        if archive_ctx:
+            result.update(archive_ctx)
+        yield _sse({"step": "complete", "result": result})
+        return
+
+    yield _sse({"step": "pe_parse",
+                "ok": True,
+                "num_sections": features["num_sections"]})
+    await asyncio.sleep(0.15)
+
+    # ── Step 5: Entropy analysis ──────────────────────────────────────────────
+    yield _sse({"step": "entropy",
+                "avg": features["avg_section_entropy"],
+                "max": features["max_section_entropy"]})
+    await asyncio.sleep(0.15)
+
+    # ── Step 6: Import table ──────────────────────────────────────────────────
+    yield _sse({"step": "imports",
+                "total":     features["num_imports"],
+                "no_iat":    features["no_import_table"],
+                "suspicious": features["suspicious_apis_found"]})
+    await asyncio.sleep(0.15)
+
+    # ── Step 7: Entry point check ─────────────────────────────────────────────
+    yield _sse({"step": "ep_check",
+                "outside_text": features["ep_outside_text"]})
+    await asyncio.sleep(0.15)
+
+    # ── Step 8 & 9: Scoring + Verdict ─────────────────────────────────────────
+    score_result = scorer.score(features)
+    yield _sse({"step": "scoring",
+                "risk_score": score_result.risk_score,
+                "verdict":    score_result.verdict,
+                "factors":    [{"label": f.label, "weight": f.weight}
+                               for f in score_result.factors]})
+    await asyncio.sleep(0.12)
+
+    # ── Complete ───────────────────────────────────────────────────────────────
+    result = _build_response(filename, features, score_result,
+                             extra=archive_ctx)
+    log.info("analyzed (stream): filename=%s sha256=%s verdict=%s score=%s",
+             filename, sha256, score_result.verdict, score_result.risk_score)
+    yield _sse({"step": "complete", "result": result})
+
+
+async def _zip_pipeline_stream(zip_filename: str,
+                               raw_bytes: bytes) -> AsyncGenerator[str, None]:
+    """
+    For ZIP uploads: flatten the archive, then run the pipeline on the
+    first valid PE found (or the first file if none are PEs).
+    """
+    def _sse(payload: Dict) -> str:
+        return f"data: {json.dumps(payload)}\n\n"
+
+    # Validate it's actually a zip
     try:
         zipfile.ZipFile(io.BytesIO(raw_bytes))
     except zipfile.BadZipFile:
-        # Misnamed file — not actually a ZIP, probe raw bytes directly
-        return _analyze_bytes(zip_filename, raw_bytes)
+        async for event in _pipeline_stream(zip_filename, raw_bytes):
+            yield event
+        return
 
+    yield _sse({"step": "received",
+                "filename": zip_filename,
+                "size": len(raw_bytes)})
+    await asyncio.sleep(0.12)
+
+    # Flatten archive
     budget = {"remaining": MAX_ZIP_TOTAL_UNCOMPRESSED, "count": 0}
     entries: List[_ZipEntry] = []
     try:
         _flatten_zip(raw_bytes, "", depth=1, budget=budget, entries=entries)
     except ZipSafetyError as exc:
-        log.warning("zip rejected: filename=%s reason=%s", zip_filename, exc)
-        feats = {
-            "sha256":           hashlib.sha256(raw_bytes).hexdigest(),
-            "file_size":        len(raw_bytes),
-            "raw_byte_entropy": 0.0,
-        }
-        return _not_pe_response(
-            zip_filename, feats,
-            parse_note=f"Archive rejected before scanning could complete: {exc}",
-        )
+        yield _sse({"step": "zip_extract", "ok": False, "error": str(exc)})
+        await asyncio.sleep(0.10)
+        feats = {"sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                 "file_size": len(raw_bytes), "raw_byte_entropy": 0.0}
+        yield _sse({"step": "complete",
+                    "result": _not_pe_response(zip_filename, feats, str(exc))})
+        return
 
-    all_names: List[str] = [e.display_name for e in entries]
+    all_names = [e.display_name for e in entries]
     real_entries = [e for e in entries if e.data]
 
+    yield _sse({"step": "zip_extract",
+                "ok": True,
+                "files": all_names[:10],
+                "total_files": len(all_names)})
+    await asyncio.sleep(0.12)
+
     if not real_entries:
-        feats = {
-            "sha256":           hashlib.sha256(raw_bytes).hexdigest(),
-            "file_size":        len(raw_bytes),
-            "raw_byte_entropy": 0.0,
-        }
-        note = ("The ZIP archive is empty — no files to analyse." if not entries else
-                "No readable files found in the archive (all entries were empty, "
-                "password-protected, or unreadable).")
-        return _not_pe_response(zip_filename, feats, parse_note=note)
+        feats = {"sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                 "file_size": len(raw_bytes), "raw_byte_entropy": 0.0}
+        yield _sse({"step": "complete",
+                    "result": _not_pe_response(zip_filename, feats,
+                              "No readable files found in archive.")})
+        return
 
-    def _contents_preview(limit: int) -> str:
-        preview = ", ".join(all_names[:limit])
-        return preview + ("…" if len(all_names) > limit else "")
-
-    # ── Pass 1: known-signature scan across every extracted file ─────────────
-    # A matching entry is then run through the FULL analysis pipeline
-    # (structural stats + signature factor), same as a raw upload would be.
-    for entry in real_entries:
-        match = signatures.scan_signatures(entry.data)
-        if match:
-            log.info("signature match in zip: archive=%s entry=%s signature=%s",
-                     zip_filename, entry.display_name, match.name)
-            return _analyze_bytes(
-                entry.display_name, entry.data,
-                extra={
-                    "archive_name": zip_filename,
-                    "archive_note": (
-                        f"Analysed '{entry.display_name}' extracted from "
-                        f"'{zip_filename}'. Archive contained {len(all_names)} "
-                        f"file(s): {_contents_preview(8)}."
-                    ),
-                },
-            )
-
-    # ── Pass 2: PE-priority structural scan ───────────────────────────────────
+    # Find the best candidate: PE-priority sort
     def _sort_key(e: _ZipEntry) -> int:
         return 0 if os.path.splitext(e.display_name)[1].lower() in _PE_PRIORITY_EXTS else 1
 
-    for entry in sorted(real_entries, key=_sort_key):
-        features = analyzer.extract_features(entry.data)
-        if not features.get("parse_error"):
-            score_result = scorer.score(features)
-            return _build_response(
-                filename=entry.display_name,
-                features=features,
-                score_result=score_result,
-                extra={
-                    "archive_name": zip_filename,
-                    "archive_note": (
-                        f"Analysed '{entry.display_name}' extracted from '{zip_filename}'. "
-                        f"Archive contained {len(all_names)} file(s): {_contents_preview(8)}."
-                    ),
-                },
-            )
-
-    # ── Nothing found ──────────────────────────────────────────────────────────
-    feats = {
-        "sha256":           hashlib.sha256(raw_bytes).hexdigest(),
-        "file_size":        len(raw_bytes),
-        "raw_byte_entropy": 0.0,
-    }
-    return _not_pe_response(
-        zip_filename, feats,
-        parse_note=(
-            f"'{zip_filename}' was scanned safely — known-signature check and PE "
-            f"structural analysis both found nothing. Files in archive: "
-            f"{_contents_preview(10)}."
+    candidate = sorted(real_entries, key=_sort_key)[0]
+    contents_preview = ", ".join(all_names[:8]) + ("…" if len(all_names) > 8 else "")
+    archive_ctx = {
+        "archive_name": zip_filename,
+        "archive_note": (
+            f"Analysed '{candidate.display_name}' extracted from '{zip_filename}'. "
+            f"Archive contained {len(all_names)} file(s): {contents_preview}."
         ),
-    )
+    }
+
+    # Stream the inner file through the full pipeline
+    # (skip the 'received' step — already emitted as zip_extract)
+    sha256 = hashlib.sha256(candidate.data).hexdigest()
+    yield _sse({"step": "hashing", "sha256": sha256})
+    await asyncio.sleep(0.12)
+
+    features = analyzer.extract_features(candidate.data)
+
+    if features.get("parse_error"):
+        yield _sse({"step": "pe_parse", "ok": False,
+                    "error": "No MZ/PE header found — not a Windows executable"})
+        await asyncio.sleep(0.10)
+        result = _not_pe_response(candidate.display_name, features)
+        result.update(archive_ctx)
+        yield _sse({"step": "complete", "result": result})
+        return
+
+    yield _sse({"step": "pe_parse",
+                "ok": True,
+                "num_sections": features["num_sections"]})
+    await asyncio.sleep(0.15)
+
+    yield _sse({"step": "entropy",
+                "avg": features["avg_section_entropy"],
+                "max": features["max_section_entropy"]})
+    await asyncio.sleep(0.15)
+
+    yield _sse({"step": "imports",
+                "total":     features["num_imports"],
+                "no_iat":    features["no_import_table"],
+                "suspicious": features["suspicious_apis_found"]})
+    await asyncio.sleep(0.15)
+
+    yield _sse({"step": "ep_check",
+                "outside_text": features["ep_outside_text"]})
+    await asyncio.sleep(0.15)
+
+    score_result = scorer.score(features)
+    yield _sse({"step": "scoring",
+                "risk_score": score_result.risk_score,
+                "verdict":    score_result.verdict,
+                "factors":    [{"label": f.label, "weight": f.weight}
+                               for f in score_result.factors]})
+    await asyncio.sleep(0.12)
+
+    result = _build_response(candidate.display_name, features, score_result,
+                             extra=archive_ctx)
+    log.info("analyzed (stream/zip): filename=%s sha256=%s verdict=%s score=%s",
+             zip_filename, sha256, score_result.verdict, score_result.risk_score)
+    yield _sse({"step": "complete", "result": result})
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.get("/health")
-def health():
-    """Liveness probe."""
-    return {"status": "ok"}
+ALLOWED_EXTS = {".exe", ".dll", ".zip", ".txt", ".bin", ".com"}
 
 
-@app.post("/analyze")
-async def analyze_upload(file: UploadFile = File(...)):
-    """
-    Upload a file for static analysis.
-
-    .zip archives are unpacked in-memory; the first valid PE found is analysed.
-    The file is NEVER written to disk, executed, or mapped as a process.
-    """
-    filename = file.filename or "unknown"
+def _validate_upload(filename: str, raw_bytes: bytes) -> None:
     ext = os.path.splitext(filename)[1].lower()
-
-    ALLOWED_EXTS = {".exe", ".dll", ".zip", ".txt", ".bin", ".com"}
     if ext not in ALLOWED_EXTS:
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(ALLOWED_EXTS))}",
         )
-
-    raw_bytes = await file.read()
-
-    if len(raw_bytes) == 0:
+    if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
     if len(raw_bytes) > 50 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File exceeds 50 MB limit.")
 
-    result = _analyze_zip(filename, raw_bytes) if ext == ".zip" else _analyze_bytes(filename, raw_bytes)
-    log.info("analyzed: filename=%s sha256=%s verdict=%s score=%s",
-             filename, result.get("sha256"), result.get("verdict"), result.get("risk_score"))
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/analyze")
+async def analyze_upload(file: UploadFile = File(...)):
+    """Classic JSON endpoint — returns the full result in one response."""
+    filename  = file.filename or "unknown"
+    raw_bytes = await file.read()
+    _validate_upload(filename, raw_bytes)
+
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".zip":
+        # Collect the full stream and return the last 'complete' event's result
+        result: Dict = {}
+        async for event in _zip_pipeline_stream(filename, raw_bytes):
+            data = json.loads(event.replace("data: ", "").strip())
+            if data.get("step") == "complete":
+                result = data.get("result", {})
+    else:
+        result = {}
+        async for event in _pipeline_stream(filename, raw_bytes):
+            data = json.loads(event.replace("data: ", "").strip())
+            if data.get("step") == "complete":
+                result = data.get("result", {})
+
+    log.info("analyzed: filename=%s verdict=%s score=%s",
+             filename, result.get("verdict"), result.get("risk_score"))
     return JSONResponse(result)
+
+
+@app.post("/analyze/stream")
+async def analyze_stream(file: UploadFile = File(...)):
+    """SSE streaming endpoint — emits one event per pipeline step."""
+    filename  = file.filename or "unknown"
+    raw_bytes = await file.read()
+    _validate_upload(filename, raw_bytes)
+
+    ext = os.path.splitext(filename)[1].lower()
+    gen = (_zip_pipeline_stream(filename, raw_bytes)
+           if ext == ".zip"
+           else _pipeline_stream(filename, raw_bytes))
+
+    return StreamingResponse(
+        gen,
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control":     "no-cache",
+            "Connection":        "keep-alive",
+        },
+    )
 
 
 @app.get("/sample/{name}")
 def analyze_sample(name: str):
-    """Analyse one of the pre-loaded demo samples by name."""
+    """Classic JSON endpoint for pre-loaded samples."""
     if name not in ALLOWED_SAMPLE_NAMES:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown sample '{name}'. Valid names: {sorted(ALLOWED_SAMPLE_NAMES)}",
-        )
+        raise HTTPException(status_code=404,
+            detail=f"Unknown sample '{name}'. Valid: {sorted(ALLOWED_SAMPLE_NAMES)}")
+    sample_path = SAMPLES_DIR / name
+    if not sample_path.exists():
+        raise HTTPException(status_code=503,
+            detail=f"Sample '{name}' not found. Run generate_samples.py first.")
+    raw_bytes = sample_path.read_bytes()
+    features  = analyzer.extract_features(raw_bytes)
+    if features.get("parse_error"):
+        return JSONResponse(_not_pe_response(name, features))
+    score_result = scorer.score(features)
+    return JSONResponse(_build_response(name, features, score_result))
 
-    if name in IN_MEMORY_SAMPLES:
-        # e.g. EICAR — generated at request time, never stored on disk where
-        # the host's own antivirus would quarantine it.
-        raw_bytes = IN_MEMORY_SAMPLES[name]()
-    else:
-        sample_path = SAMPLES_DIR / name
-        if not sample_path.exists():
-            raise HTTPException(
-                status_code=503,
-                detail=f"Sample '{name}' not found on server. Run generate_samples.py first.",
-            )
-        raw_bytes = sample_path.read_bytes()
 
-    return JSONResponse(_analyze_bytes(name, raw_bytes))
+@app.get("/sample/{name}/stream")
+async def stream_sample(name: str):
+    """SSE streaming endpoint for pre-loaded samples."""
+    if name not in ALLOWED_SAMPLE_NAMES:
+        raise HTTPException(status_code=404,
+            detail=f"Unknown sample '{name}'. Valid: {sorted(ALLOWED_SAMPLE_NAMES)}")
+    sample_path = SAMPLES_DIR / name
+    if not sample_path.exists():
+        raise HTTPException(status_code=503,
+            detail=f"Sample '{name}' not found. Run generate_samples.py first.")
+    raw_bytes = sample_path.read_bytes()
+    return StreamingResponse(
+        _pipeline_stream(name, raw_bytes),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/samples")
 def list_samples():
-    """List available pre-loaded sample names."""
     return {"samples": sorted(ALLOWED_SAMPLE_NAMES)}

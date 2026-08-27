@@ -3,11 +3,10 @@
  *
  * Handles:
  *  - Drag-and-drop + click-to-browse file upload
- *  - Pre-loaded sample button clicks (GET /sample/{name})
- *  - POST /analyze for user-uploaded files
+ *  - Pre-loaded sample button clicks
+ *  - Step-by-step SSE pipeline streaming (/analyze/stream & /sample/{name}/stream)
  *  - Rendering results: verdict pill, score ring, stat grid, factor bars, API chips
- *  - Score ring animation (0 → final over 650ms)
- *  - Loading spinner + error state
+ *  - Animated pipeline progress panel
  */
 
 "use strict";
@@ -18,33 +17,34 @@ const API_BASE = window.location.protocol === "file:"
 
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
-const dropZone      = document.getElementById("drop-zone");
-const fileInput     = document.getElementById("file-input");
-const browseBtn     = document.getElementById("browse-btn");
-const loadingState  = document.getElementById("loading-state");
-const errorState    = document.getElementById("error-state");
-const errorMessage  = document.getElementById("error-message");
-const resultsPanel  = document.getElementById("results-panel");
+const dropZone        = document.getElementById("drop-zone");
+const fileInput       = document.getElementById("file-input");
+const browseBtn       = document.getElementById("browse-btn");
+const pipelinePanel   = document.getElementById("pipeline-panel");
+const pipelineSpinner = document.getElementById("pipeline-spinner");
+const pipelineSteps   = document.getElementById("pipeline-steps");
+const errorState      = document.getElementById("error-state");
+const errorMessage    = document.getElementById("error-message");
+const resultsPanel    = document.getElementById("results-panel");
 
 // Results fields
-const scoreNumber   = document.getElementById("score-number");
-const ringFill      = document.getElementById("ring-fill");
-const verdictPill   = document.getElementById("verdict-pill");
-const verdictMeta   = document.getElementById("verdict-meta");
-const filenameEl    = document.getElementById("result-filename");
-const statSha       = document.getElementById("stat-sha256");
-const statSize      = document.getElementById("stat-size");
-const statSections  = document.getElementById("stat-sections");
-const statEntropy   = document.getElementById("stat-entropy");
-const apiSection    = document.getElementById("api-section");
-const apiChips      = document.getElementById("api-chips");
-const factorsList   = document.getElementById("factors-list");
-const factorsSection = document.getElementById("factors-section");
-const parseNote     = document.getElementById("parse-note");
-const parseNoteText = document.getElementById("parse-note-text");
+const scoreNumber     = document.getElementById("score-number");
+const ringFill        = document.getElementById("ring-fill");
+const verdictPill     = document.getElementById("verdict-pill");
+const verdictMeta     = document.getElementById("verdict-meta");
+const filenameEl      = document.getElementById("result-filename");
+const statSha         = document.getElementById("stat-sha256");
+const statSize        = document.getElementById("stat-size");
+const statSections    = document.getElementById("stat-sections");
+const statEntropy     = document.getElementById("stat-entropy");
+const apiSection      = document.getElementById("api-section");
+const apiChips        = document.getElementById("api-chips");
+const factorsList     = document.getElementById("factors-list");
+const factorsSection  = document.getElementById("factors-section");
+const parseNote       = document.getElementById("parse-note");
+const parseNoteText   = document.getElementById("parse-note-text");
 
 // ── Ring geometry ─────────────────────────────────────────────────────────────
-// SVG circle: r=42, so circumference = 2π×42 ≈ 263.89
 const RING_CIRCUMFERENCE = 2 * Math.PI * 42;
 
 // ── Utility ───────────────────────────────────────────────────────────────────
@@ -80,17 +80,31 @@ function barColorClass(weight) {
   return "bar-high";
 }
 
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 // ── UI state helpers ──────────────────────────────────────────────────────────
 
-function showLoading() {
-  loadingState.classList.add("visible");
+function resetPipelineUI() {
+  pipelineSteps.innerHTML = "";
+  pipelineSpinner.classList.remove("done");
+  pipelinePanel.classList.add("visible");
   errorState.classList.remove("visible");
   resultsPanel.classList.remove("visible");
   resultsPanel.style.display = "none";
 }
 
+function finishPipelineUI() {
+  pipelineSpinner.classList.add("done");
+}
+
 function showError(msg) {
-  loadingState.classList.remove("visible");
+  pipelinePanel.classList.remove("visible");
   errorState.classList.add("visible");
   errorMessage.textContent = msg;
   resultsPanel.classList.remove("visible");
@@ -98,8 +112,158 @@ function showError(msg) {
 }
 
 function hideTransient() {
-  loadingState.classList.remove("visible");
   errorState.classList.remove("visible");
+}
+
+// ── Step card builder ─────────────────────────────────────────────────────────
+
+function addPipelineStep(icon, label, value, badgeText, badgeClass) {
+  const stepEl = document.createElement("div");
+  stepEl.className = "pipeline-step";
+  stepEl.innerHTML = `
+    <div class="step-icon" aria-hidden="true">${icon}</div>
+    <div class="step-body">
+      <div class="step-label">${escHtml(label)}</div>
+      <div class="step-value">${escHtml(value)}</div>
+    </div>
+    ${badgeText ? `<span class="step-badge ${badgeClass}">${escHtml(badgeText)}</span>` : ""}
+  `;
+  pipelineSteps.appendChild(stepEl);
+  void stepEl.offsetHeight; // Force reflow
+  stepEl.classList.add("visible");
+
+  // Auto-scroll step into view
+  stepEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// ── Event dispatch per pipeline SSE event ─────────────────────────────────────
+
+function handlePipelineEvent(data) {
+  switch (data.step) {
+    case "received":
+      addPipelineStep(
+        "📥",
+        "1. File Ingestion",
+        `Received '${data.filename}' (${formatBytes(data.size)})`,
+        "Ingested",
+        "neutral"
+      );
+      break;
+
+    case "zip_extract":
+      if (data.ok === false) {
+        addPipelineStep(
+          "📦",
+          "2. ZIP Extraction",
+          `Decompression failed: ${data.error}`,
+          "Rejected",
+          "bad"
+        );
+      } else {
+        const details = data.files ? `Extracted files: ${data.files.join(", ")}` : `Extracted target from archive`;
+        addPipelineStep(
+          "📦",
+          "2. ZIP Decompression",
+          details,
+          "Unpacked",
+          "ok"
+        );
+      }
+      break;
+
+    case "hashing":
+      addPipelineStep(
+        "🔑",
+        "3. SHA-256 Hashing",
+        `SHA-256: ${data.sha256}`,
+        "Hashed",
+        "neutral"
+      );
+      break;
+
+    case "pe_parse":
+      if (data.ok) {
+        addPipelineStep(
+          "🧩",
+          "4. PE Structure Parsing",
+          `MZ/PE header valid · ${data.num_sections} section(s) discovered`,
+          "Valid PE",
+          "ok"
+        );
+      } else {
+        addPipelineStep(
+          "🧩",
+          "4. PE Structure Parsing",
+          data.error || "No valid PE/MZ header present",
+          "Not a PE",
+          "neutral"
+        );
+      }
+      break;
+
+    case "entropy":
+      {
+        const maxVal = data.max;
+        const badge = maxVal > 7.2 ? "High (High Risk)" : (maxVal > 6.5 ? "Elevated" : "Normal");
+        const bClass = maxVal > 7.2 ? "bad" : (maxVal > 6.5 ? "warn" : "ok");
+        addPipelineStep(
+          "📊",
+          "5. Shannon Entropy Calculation",
+          `Avg section entropy: ${data.avg.toFixed(2)} bits/byte · Max section entropy: ${maxVal.toFixed(2)} bits/byte`,
+          badge,
+          bClass
+        );
+      }
+      break;
+
+    case "imports":
+      {
+        const count = data.suspicious ? data.suspicious.length : 0;
+        const text = count > 0
+          ? `Total imports: ${data.total} · Flagged APIs: ${data.suspicious.join(", ")}`
+          : `Total imports: ${data.total} · No high-risk injection/evasion APIs flagged`;
+        const badge = count > 0 ? `${count} Flagged API(s)` : "Clean";
+        const bClass = count > 0 ? "bad" : "ok";
+        addPipelineStep(
+          "⚙️",
+          "6. Import Table Scan",
+          text,
+          badge,
+          bClass
+        );
+      }
+      break;
+
+    case "ep_check":
+      {
+        const text = data.outside_text
+          ? "Entry point is outside the primary .text code section (packers/loaders pattern)"
+          : "Entry point is inside the standard .text code section";
+        const badge = data.outside_text ? "EP Anomaly" : "Standard EP";
+        const bClass = data.outside_text ? "warn" : "ok";
+        addPipelineStep(
+          "📍",
+          "7. Entry Point Location Check",
+          text,
+          badge,
+          bClass
+        );
+      }
+      break;
+
+    case "scoring":
+      {
+        const bClass = data.verdict === "MALICIOUS" ? "bad" : (data.verdict === "SUSPICIOUS" ? "warn" : "ok");
+        addPipelineStep(
+          "⚖️",
+          "8 & 9. Heuristic Risk Scoring & Verdict",
+          `Score: ${data.risk_score}/100 · Verdict: ${data.verdict} (${data.factors.length} weighted factor(s) triggered)`,
+          data.verdict,
+          bClass
+        );
+      }
+      break;
+  }
 }
 
 // ── Score ring animation ──────────────────────────────────────────────────────
@@ -119,7 +283,6 @@ function animateRing(targetScore) {
   function step(now) {
     const elapsed  = now - start;
     const progress = Math.min(elapsed / duration, 1);
-    // Ease-out cubic
     const eased    = 1 - Math.pow(1 - progress, 3);
     const current  = eased * targetScore;
 
@@ -142,8 +305,8 @@ function animateRing(targetScore) {
 function renderResult(data) {
   hideTransient();
 
-  // Parse-note banner (non-PE files, incl. signature hits on non-PE content)
-  if (data.parse_note) {
+  // Parse-note banner (non-PE files)
+  if (data.not_pe && data.parse_note) {
     parseNoteText.textContent = data.parse_note;
     parseNote.classList.add("visible");
   } else {
@@ -220,13 +383,12 @@ function renderResult(data) {
       : `<p class="no-factors">No risk signals triggered — file appears structurally normal.</p>`;
   }
 
-  // Show results panel, then animate
+  // Show results panel
   resultsPanel.style.display = "block";
-  // Force reflow so transition fires
   void resultsPanel.offsetHeight;
   resultsPanel.classList.add("visible");
 
-  // Animate ring (skip for non-PE files — score is always 0)
+  // Ring styling / animation
   if (!data.not_pe) {
     setTimeout(() => animateRing(data.risk_score), 50);
   } else {
@@ -236,7 +398,7 @@ function renderResult(data) {
     ringFill.style.strokeDashoffset = RING_CIRCUMFERENCE;
   }
 
-  // Animate factor bars (staggered)
+  // Animate factor bars
   const fills = factorsList.querySelectorAll(".factor-bar-fill");
   fills.forEach((el, i) => {
     setTimeout(() => {
@@ -250,35 +412,65 @@ function renderResult(data) {
   }, 100);
 }
 
-// ── HTML escape ───────────────────────────────────────────────────────────────
+// ── SSE Stream Reader Helper ──────────────────────────────────────────────────
 
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+async function readSseStream(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n\n");
+    buffer = lines.pop(); // keep partial trailing buffer
+
+    for (const block of lines) {
+      const line = block.trim();
+      if (line.startsWith("data: ")) {
+        try {
+          const payload = JSON.parse(line.slice(6));
+          if (payload.step === "complete") {
+            finishPipelineUI();
+            renderResult(payload.result);
+          } else {
+            handlePipelineEvent(payload);
+          }
+        } catch (e) {
+          console.error("Failed to parse SSE payload", e, line);
+        }
+      }
+    }
+  }
+
+  // Flush remaining buffer if any
+  if (buffer.trim().startsWith("data: ")) {
+    try {
+      const payload = JSON.parse(buffer.trim().slice(6));
+      if (payload.step === "complete") {
+        finishPipelineUI();
+        renderResult(payload.result);
+      } else {
+        handlePipelineEvent(payload);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
 }
 
 // ── API calls ─────────────────────────────────────────────────────────────────
 
 async function analyzeFile(file) {
-  showLoading();
+  resetPipelineUI();
 
-  // Read the file into memory FIRST. If the OS/antivirus blocks access to it
-  // (Windows Defender does this to real EICAR files the moment they touch
-  // disk), the read fails here — which is a local problem, not a backend one,
-  // and deserves an accurate error message.
   let buf;
   try {
     buf = await file.arrayBuffer();
   } catch (err) {
-    showError(
-      `Could not read '${file.name}' from disk — your antivirus is likely ` +
-      `blocking or quarantining it (this is expected for real EICAR files). ` +
-      `Use the "EICAR test file" sample button instead: it is generated ` +
-      `in-memory on the server, so no antivirus can interfere. (${err.message})`
-    );
+    showError(`Could not read '${file.name}' from disk: ${err.message}`);
     return;
   }
 
@@ -286,36 +478,40 @@ async function analyzeFile(file) {
   form.append("file", new Blob([buf]), file.name);
 
   try {
-    const res = await fetch(`${API_BASE}/analyze`, {
+    const res = await fetch(`${API_BASE}/analyze/stream`, {
       method: "POST",
       body: form,
-      cache: "no-store",   // always compute fresh — never serve a cached result
+      cache: "no-store",
     });
-    const json = await res.json();
+
     if (!res.ok) {
+      const json = await res.json().catch(() => ({}));
       showError(json.detail ?? `Server error (${res.status})`);
       return;
     }
-    renderResult(json);
+
+    await readSseStream(res);
   } catch (err) {
-    showError(`Could not reach the ScanForge backend at ${API_BASE || window.location.origin}. Is it running? (${err.message})`);
+    showError(`Could not reach ScanForge backend at ${API_BASE || window.location.origin}. Is it running? (${err.message})`);
   }
 }
 
 async function analyzeSample(name) {
-  showLoading();
+  resetPipelineUI();
   try {
-    const res = await fetch(`${API_BASE}/sample/${encodeURIComponent(name)}`, {
-      cache: "no-store",   // always compute fresh — never serve a cached result
+    const res = await fetch(`${API_BASE}/sample/${encodeURIComponent(name)}/stream`, {
+      cache: "no-store",
     });
-    const json = await res.json();
+
     if (!res.ok) {
+      const json = await res.json().catch(() => ({}));
       showError(json.detail ?? `Server error (${res.status})`);
       return;
     }
-    renderResult(json);
+
+    await readSseStream(res);
   } catch (err) {
-    showError(`Could not reach the ScanForge backend at ${API_BASE}. Is it running? (${err.message})`);
+    showError(`Could not reach ScanForge backend at ${API_BASE}. Is it running? (${err.message})`);
   }
 }
 
@@ -329,7 +525,7 @@ browseBtn.addEventListener("click", (e) => {
 fileInput.addEventListener("change", () => {
   if (fileInput.files.length > 0) {
     analyzeFile(fileInput.files[0]);
-    fileInput.value = "";    // reset so same file can be re-selected
+    fileInput.value = "";
   }
 });
 

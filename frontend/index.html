@@ -95,20 +95,18 @@
           <span class="sample-dot" style="background:var(--color-suspicious)"></span>
           Suspicious imports
         </button>
-
-        <button class="sample-btn" id="btn-eicar" type="button"
-                data-sample="eicar.com"
-                aria-label="Analyse the EICAR standard antivirus test file">
-          <span class="sample-dot" style="background:var(--color-malicious)"></span>
-          EICAR test file
-        </button>
       </div>
     </section>
 
-    <!-- ── Loading ─────────────────────────────────────────────────────────── -->
-    <div id="loading-state" role="status" aria-live="polite" aria-label="Analysing file">
-      <div class="spinner" aria-hidden="true"></div>
-      <p class="loading-text">Analysing PE structure…</p>
+    <!-- ── Pipeline Execution Panel ──────────────────────────────────────── -->
+    <div id="pipeline-panel" role="region" aria-label="Analysis pipeline progress">
+      <div class="pipeline-header">
+        <div class="pipeline-spinner" id="pipeline-spinner"></div>
+        <span class="pipeline-header-label">Analysis Pipeline Execution</span>
+      </div>
+      <div class="pipeline-steps" id="pipeline-steps">
+        <!-- Step cards populated dynamically by SSE -->
+      </div>
     </div>
 
     <!-- ── Error ───────────────────────────────────────────────────────────── -->
